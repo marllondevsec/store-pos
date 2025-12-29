@@ -2,17 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Sistema simples de caixa (arquivo-texto, salvamento em tempo real)
-Atualizações:
- - Gerenciamento de produtos (adicionar/editar/deletar/ajustar estoque/listar)
- - Integração do catálogo com o registro de vendas (sugestão de preço, atualização de estoque)
- - Agregação de produtos (quantidade + receita)
- - Relatórios semanais (todo sábado) e mensais (último dia do mês)
- - Painel de destaques (top vendidos)
- - Salva summaries em logs/
- - Ao primeiro uso: pede email do caixa e email da loja e salva em email_config.json
- - Armazena (opcional) senha do e-mail (codificada em base64)
- - Envia automaticamente o log ao fechar o caixa
- - Menu para configurar e-mails, senha, enviar manualmente e reenviar outbox
+Versão atualizada — alterações principais descritas no final do arquivo.
 Compatível com Python 3.6+
 """
 import os
@@ -29,6 +19,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, date, timedelta
 import uuid
 import tempfile
+import time
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
@@ -47,7 +38,7 @@ TWOPLACES = Decimal('0.01')
 def ensure_dirs():
     for d in (LOG_DIR, OUTBOX_DIR):
         if not os.path.exists(d):
-            os.makedirs(d)
+            os.makedirs(d, exist_ok=True)
 
 def atomic_write(path, content):
     dirn = os.path.dirname(path) or "."
@@ -83,8 +74,7 @@ def clear_screen():
         else:
             os.system('clear')
     except Exception:
-        # fallback: print algumas linhas novas
-        print("\n" * 50)
+        print("\n" * 10)
 
 def pause():
     try:
@@ -93,13 +83,69 @@ def pause():
         pass
 
 # ---------------------------
+# banner de inicialização
+# ---------------------------
+_PT_WEEKDAYS = {
+    'Monday': 'Segunda-feira',
+    'Tuesday': 'Terça-feira',
+    'Wednesday': 'Quarta-feira',
+    'Thursday': 'Quinta-feira',
+    'Friday': 'Sexta-feira',
+    'Saturday': 'Sábado',
+    'Sunday': 'Domingo'
+}
+
+def show_banner():
+    banner = r"""
+   .----.
+   |0.00|
+ __|____|__
+|  ______--|
+`-/.::::.\-'Point of Sale
+ `--------' by MarllonDevSec
+                                                                            """
+    clear_screen()
+    print(banner)
+    now = datetime.now()
+    weekday_en = now.strftime('%A')
+    weekday = _PT_WEEKDAYS.get(weekday_en, weekday_en)
+    print(f"Start time: {now.strftime('%Y-%m-%d %H:%M:%S')} — {weekday}")
+    print("-" * 55)
+    print("Initializing...")
+    time.sleep(0.6)
+    print()
+
+# ---------------------------
 # utilitários para Decimal e produtos
 # ---------------------------
 def parse_decimal(s, default=None):
-    if s is None or (isinstance(s, str) and s.strip() == ""):
+    """Tenta converter strings comuns em Decimal.
+    Aceita formatos com vírgula como separador decimal e pontos como milhares.
+    Ex: '1.234,56' -> Decimal('1234.56'), '19,90' -> Decimal('19.90')
+    """
+    if s is None:
         return default
+    if isinstance(s, Decimal):
+        return s
+    if isinstance(s, str):
+        s = s.strip()
+        if s == "":
+            return default
+        # remover separadores de milhares (pontos) e transformar vírgula em ponto
+        # mas cuidado com entradas inválidas
+        try:
+            # se houver mais de 1 vírgula ou mais de 1 ponto, normalize
+            if s.count(',') > 0 and s.count('.') > 0:
+                # formato provável: 1.234,56
+                s = s.replace('.', '')
+                s = s.replace(',', '.')
+            else:
+                s = s.replace(',', '.')
+            return Decimal(s)
+        except (InvalidOperation, ValueError):
+            return default
     try:
-        return Decimal(str(s))
+        return Decimal(s)
     except Exception:
         return default
 
@@ -117,13 +163,18 @@ def load_products():
     try:
         with open(PRODUCTS_FILE, 'r', encoding='utf-8') as f:
             raw = json.load(f)
-        # raw expected: dict lowername -> { 'name': ..., 'price': '19.90', 'stock': '10' or None }
         out = {}
         for k, v in raw.items():
-            name = v.get('name') if isinstance(v, dict) else k
-            price = parse_decimal(v.get('price')) if isinstance(v, dict) else None
-            stock = parse_decimal(v.get('stock')) if isinstance(v, dict) else None
-            out[k] = {'name': name, 'price': price, 'stock': stock}
+            # chave já em lowercase idealmente
+            if isinstance(v, dict):
+                name = v.get('name', k)
+                price = parse_decimal(v.get('price'))
+                stock = parse_decimal(v.get('stock'))
+            else:
+                name = v
+                price = None
+                stock = None
+            out[k.lower()] = {'name': name, 'price': price, 'stock': stock}
         return out
     except Exception:
         return {}
@@ -147,19 +198,17 @@ def find_product_by_name(products, name):
     if not name:
         return None, None
     key = name.strip().lower()
-    # direct match
     if key in products:
         return key, products[key]
-    # try partial match: find first that contains the name
     for k, v in products.items():
-        if name.strip().lower() in k:
+        if key in k or key in v.get('name', '').lower():
             return k, v
     return None, None
 
 def list_products(products):
     if not products:
         print("Nenhum produto cadastrado.")
-        return
+        return []
     items = sorted(products.items(), key=lambda x: x[1].get('name', x[0]).lower())
     print("\n=== PRODUTOS CADASTRADOS ===")
     print("IDX | Nome | Preço | Estoque")
@@ -169,6 +218,7 @@ def list_products(products):
         print(f"{i:>3} | {v.get('name')} | R$ {price} | {stock}")
     return items
 
+# ... (as before: add_product_interactive, select_product_by_index, edit, delete, adjust stock)
 def add_product_interactive():
     products = load_products()
     name = input("Nome do produto: ").strip()
@@ -200,7 +250,6 @@ def select_product_by_index(products, prompt_text="Escolha o produto (idx): "):
             k, v = items[idx-1]
             return k, v
     except Exception:
-        # try by name
         k, v = find_product_by_name(products, sel)
         return k, v
     print("Seleção inválida.")
@@ -224,8 +273,7 @@ def edit_product_interactive():
     stock_old = money(v['stock']) if v.get('stock') is not None else ""
     stock_raw = input(f"Novo estoque [{stock_old}] (deixe em branco para manter): ").strip()
     stock = parse_decimal(stock_raw, default=v.get('stock')) if stock_raw != "" else v.get('stock')
-    # remove old key if name changed
-    if new_key != k:
+    if new_key != k and k in products:
         del products[k]
     products[new_key] = {'name': new_name, 'price': price, 'stock': stock}
     if save_products(products):
@@ -320,7 +368,13 @@ def manage_products_menu():
 def money(value):
     if value is None:
         return "0.00"
-    return f"{value.quantize(TWOPLACES, rounding=ROUND_HALF_UP)}"
+    if isinstance(value, Decimal):
+        return f"{value.quantize(TWOPLACES, rounding=ROUND_HALF_UP)}"
+    try:
+        d = Decimal(str(value))
+        return f"{d.quantize(TWOPLACES, rounding=ROUND_HALF_UP)}"
+    except Exception:
+        return "0.00"
 
 def get_log_path(session_date):
     filename = f"{STORE_NAME}_{session_date}.txt"
@@ -351,7 +405,6 @@ def add_sale(session_date):
     if produto == "":
         print("Produto vazio. Operação cancelada.")
         return
-    # if product exists in catalog, suggest price and show stock
     key, prod = find_product_by_name(products, produto)
     suggested_price = None
     suggested_stock = None
@@ -367,9 +420,8 @@ def add_sale(session_date):
     if qtd_raw == "":
         qtd = Decimal(1)
     else:
-        try:
-            qtd = Decimal(qtd_raw)
-        except InvalidOperation:
+        qtd = parse_decimal(qtd_raw)
+        if qtd is None:
             print("Quantidade inválida. Use número. Operação cancelada.")
             return
     if suggested_price is not None:
@@ -377,16 +429,14 @@ def add_sale(session_date):
         if price_raw == "":
             price = suggested_price
         else:
-            try:
-                price = Decimal(price_raw)
-            except Exception:
+            price = parse_decimal(price_raw)
+            if price is None:
                 print("Preço inválido. Operação cancelada.")
                 return
     else:
         price_raw = input("Preço unitário (ex: 19.90): ").strip()
-        try:
-            price = Decimal(price_raw)
-        except Exception:
+        price = parse_decimal(price_raw)
+        if price is None:
             print("Preço inválido. Operação cancelada.")
             return
     subtotal = (qtd * price).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
@@ -399,7 +449,6 @@ def add_sale(session_date):
         print("Erro salvando venda:", e)
         return
     print(f"Venda registrada: {produto} x{money(qtd)}  subtotal: R$ {money(subtotal)}")
-    # atualizar estoque se produto no catálogo
     if prod and prod.get('stock') is not None:
         update = input("Atualizar estoque do catálogo subtraindo esta quantidade? (s/N): ").strip().lower()
         if update == 's':
@@ -468,6 +517,26 @@ def save_session(state, session_date):
     content = f"state={state}\ndate={session_date}\nstore={STORE_NAME}\n"
     atomic_write(SESSION_FILE, content)
 
+def reopen_session(session_date=None):
+    """Reabre uma sessão previamente fechada. Se session_date for None, pede ao usuário."""
+    info = load_session()
+    if session_date is None:
+        session_date = input("Data da sessão a reabrir (YYYY-MM-DD) [hoje]: ").strip()
+        if session_date == "":
+            session_date = date.today().isoformat()
+    # se não houver arquivo de sessão, criar
+    if not info:
+        print("Nenhuma sessão anterior encontrada — criando nova sessão OPEN para:", session_date)
+        save_session('OPEN', session_date)
+        return
+    # se a sessão atual não corresponder, permitir reabrir explicitamente
+    if info.get('date') == session_date and info.get('state') == 'OPEN':
+        print(f"A sessão {session_date} já está aberta.")
+        return
+    # sobrescrever com OPEN
+    save_session('OPEN', session_date)
+    print(f"Sessão {session_date} reaberta (state=OPEN).")
+
 def close_cash(session_date, email_conf):
     info = load_session()
     if not info or info.get('state') != 'OPEN' or info.get('date') != session_date:
@@ -487,7 +556,6 @@ def close_cash(session_date, email_conf):
     append_line(logp, summary_line)
     save_session('CLOSED', session_date)
     print("Caixa fechado. Registro salvo.")
-    # enviar automaticamente o log do dia
     send_log_with_handling(email_conf, logp, session_date, total)
 
 # ---------------------------
@@ -686,16 +754,13 @@ def save_email_config(conf):
         return False
 
 def prompt_email_setup(existing_conf=None, ask_password=False):
-    """
-    Nova ordem: pedir primeiro e-mail do caixa e senha (se ask_password=True),
-    depois perguntar e-mail destino.
-    """
     print("\n=== Configuração de E-mails ===")
     if existing_conf is None:
         existing_conf = {}
     default_from = existing_conf.get('email_from', '')
     default_to = existing_conf.get('email_to', '')
-    # email_from
+    default_smtp = existing_conf.get('smtp_server', 'smtp.gmail.com')
+    default_port = existing_conf.get('smtp_port', 587)
     while True:
         prompt = "E-mail do caixa (emissor) [{}]: ".format(default_from) if default_from else "E-mail do caixa (emissor): "
         em_from = input(prompt).strip()
@@ -706,15 +771,11 @@ def prompt_email_setup(existing_conf=None, ask_password=False):
         print("E-mail inválido. Tente novamente (ex: pandacell.caixa@gmail.com).")
     conf = existing_conf.copy()
     conf['email_from'] = em_from
-
-    # Se solicitado, pedir a senha do caixa agora (explicando que deve ser senha de app)
     if ask_password:
         print("\nInforme a senha do e-mail do caixa. Se estiver usando Gmail, informe a *app password* (senha de app), não a senha normal da conta.")
         pwd = getpass("Senha (app password) do e-mail do caixa (deixe em branco para não salvar): ")
         if pwd:
             conf['email_password_b64'] = base64.b64encode(pwd.encode('utf-8')).decode('ascii')
-
-    # email_to (destinatário)
     while True:
         prompt = "E-mail da loja (destinatário) [{}]: ".format(default_to) if default_to else "E-mail da loja (destinatário): "
         em_to = input(prompt).strip()
@@ -723,9 +784,18 @@ def prompt_email_setup(existing_conf=None, ask_password=False):
         if is_valid_email(em_to):
             break
         print("E-mail inválido. Tente novamente (ex: pandacell@gmail.com).")
-
     conf['email_to'] = em_to
-
+    # smtp server and port
+    sm = input(f"SMTP server [{default_smtp}]: ").strip()
+    if sm:
+        conf['smtp_server'] = sm
+    else:
+        conf['smtp_server'] = default_smtp
+    port_raw = input(f"SMTP port [{default_port}]: ").strip()
+    try:
+        conf['smtp_port'] = int(port_raw) if port_raw else int(default_port)
+    except Exception:
+        conf['smtp_port'] = int(default_port)
     if save_email_config(conf):
         print("Configuração de e-mails salva em:", EMAIL_CONFIG_FILE)
     else:
@@ -791,12 +861,11 @@ def send_log_by_email(email_conf, log_path, session_date, total, prompt_if_no_pa
             conf = load_email_config()
             conf['email_password_b64'] = base64.b64encode(password.encode('utf-8')).decode('ascii')
             save_email_config(conf)
-    # montar mensagem
     msg = EmailMessage()
-    msg['Subject'] = f"PandaCell - Log do Caixa {session_date}"
+    msg['Subject'] = f"{STORE_NAME} - Log do Caixa {session_date}"
     msg['From'] = email_from
     msg['To'] = email_to
-    body = ("PandaCell - Fechamento do Caixa\n\n"
+    body = (f"{STORE_NAME} - Fechamento do Caixa\n\n"
             f"Data: {session_date}\n"
             f"Total do dia: R$ {money(total)}\n\n"
             "O log completo segue em anexo.\n")
@@ -804,7 +873,6 @@ def send_log_by_email(email_conf, log_path, session_date, total, prompt_if_no_pa
     with open(log_path, 'rb') as f:
         data = f.read()
         msg.add_attachment(data, maintype='text', subtype='plain', filename=os.path.basename(log_path))
-    # tentativa de envio
     try:
         if smtp_port == 465:
             with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
@@ -825,23 +893,21 @@ def send_log_with_handling(email_conf, log_path, session_date, total):
     try:
         ok, err = send_log_by_email(email_conf, log_path, session_date, total, prompt_if_no_password=True)
         if ok:
-            print("📧 Log enviado com sucesso para", email_conf.get('email_to'))
+            print("Log enviado com sucesso para", email_conf.get('email_to'))
         else:
-            print("❌ Falha no envio do e-mail:", err)
+            print("Falha no envio do e-mail:", err)
             save_failed_to_outbox(log_path, session_date, err)
     except Exception as ex:
-        print("❌ Erro ao tentar enviar e-mail:", ex)
+        print("Erro ao tentar enviar e-mail:", ex)
         save_failed_to_outbox(log_path, session_date, str(ex))
 
 def save_failed_to_outbox(log_path, session_date, reason):
-    # copia arquivo para outbox com metadata
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = os.path.basename(log_path)
         out_name = f"{session_date}_{ts}_{fname}"
         out_path = os.path.join(OUTBOX_DIR, out_name)
         shutil.copy2(log_path, out_path)
-        # metadata
         meta = {
             'saved_at': datetime.now().isoformat(sep=' ', timespec='seconds'),
             'reason': reason,
@@ -859,7 +925,6 @@ def resend_outbox(email_conf):
         return
     for fname in files:
         path = os.path.join(OUTBOX_DIR, fname)
-        # infer session_date from filename prefix (we used session_date_ts_filename)
         try:
             parts = fname.split('_', 2)
             session_date = parts[0]
@@ -867,7 +932,7 @@ def resend_outbox(email_conf):
             session_date = date.today().isoformat()
         print("\nTentando reenviar:", path)
         try:
-            total = compute_total(session_date)  # tentativa: compute total from logs if exists
+            total = compute_total(session_date)
         except Exception:
             total = Decimal('0.00')
         ok, err = send_log_by_email(email_conf, path, session_date, total, prompt_if_no_password=True)
@@ -882,7 +947,6 @@ def resend_outbox(email_conf):
                 pass
         else:
             print("Falha no reenvio:", err)
-            # manter no outbox para nova tentativa
 
 # ---------------------------
 # menus e fluxo principal
@@ -917,9 +981,9 @@ def configure_emails_interactive_menu():
 # inicialização / main
 # ---------------------------
 def main():
+    show_banner()
     ensure_dirs()
     email_conf = load_email_config()
-    # se não tiver e-mails, pedir (agora pede e-mail do caixa + senha primeiro, depois e-mail destino)
     if not email_conf.get('email_from') or not email_conf.get('email_to'):
         print("Parece que é a primeira vez executando o programa ou os e-mails não estão configurados.")
         email_conf = prompt_email_setup(existing_conf=email_conf, ask_password=True)
@@ -928,7 +992,6 @@ def main():
     while True:
         show_menu(email_conf)
         choice = input("Escolha: ").strip()
-        # LIMPAR A TELA ANTES DE EXECUTAR A AÇÃO (evita acumular saídas antigas)
         clear_screen()
         if choice == '1':
             add_sale(today)
@@ -940,11 +1003,14 @@ def main():
         elif choice == '4':
             close_cash(today, email_conf)
         elif choice == '5':
-            # função reopen_session não está definida no código original; se existir, ótimo.
             try:
-                reopen_session(today)
-            except NameError:
-                print("Funcionalidade 'reabrir sessão' não disponível neste build.")
+                reopen_session(None)
+                # atualiza variável today para a sessão atual no arquivo
+                info = load_session()
+                if info:
+                    today = info.get('date', today)
+            except Exception as e:
+                print("Erro ao reabrir sessão:", e)
         elif choice == '6':
             show_top_week()
         elif choice == '7':
@@ -956,7 +1022,6 @@ def main():
         elif choice == '10':
             email_conf = configure_password_interactive()
         elif choice == '11':
-            # enviar log do dia agora
             logp = get_log_path(today)
             total = compute_total(today)
             send_log_with_handling(email_conf, logp, today, total)
@@ -965,6 +1030,11 @@ def main():
         elif choice == '13':
             manage_products_menu()
         elif choice == '0':
+            info = load_session()
+            if info and info.get('state') == 'OPEN':
+                confirm = input("Existe uma sessão OPEN. Deseja realmente sair sem fechar o caixa? (s/N): ").strip().lower()
+                if confirm != 's':
+                    continue
             print("Saindo do programa.")
             sys.exit(0)
         else:
@@ -972,3 +1042,14 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# ---------------------------
+# Alterações / notas desta versão:
+# - Implementada função reopen_session(session_date=None) para reabrir sessões fechadas.
+# - Melhor tratamento de parse_decimal: aceita entradas com vírgula como separador decimal e pontos como milhares.
+# - Prompt de configuração de e-mail agora pergunta também por SMTP server e porta (com valores padrão).
+# - show_banner exibe o dia da semana em português (mapeamento simples).
+# - Peças de validação e tolerância a erros adicionadas em pontos de entrada de dados.
+# - Pequenas correções de robustez ao salvar arquivos (existência de diretórios e uso de os.makedirs(..., exist_ok=True)).
+# - Atualizado comportamento de saída para perguntar antes de sair se existir sessão OPEN.
+# ---------------------------
